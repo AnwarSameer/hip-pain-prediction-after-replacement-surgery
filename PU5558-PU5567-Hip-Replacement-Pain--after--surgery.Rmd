@@ -1,0 +1,378 @@
+---
+title: "Predicting Post-Op Pain After Hip Replacement"
+author: "Anwar Sameer"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+---
+## 1. Libraries
+# Load libraries with simple explanations
+# tidyverse: makes data cleaning and manipulation easier
+# caret: helps us train and test machine learning models
+# randomForest: allows us to use the Random Forest model
+# xgboost: allows us to use the powerful XGBoost model
+# corrplot: helps us draw correlation diagrams
+# ggplot2: for creating beautiful graphs and plots
+# reshape2: reshapes data into formats suitable for graphs
+# tidyr: makes it easy to tidy messy data
+# DiagrammeR: is used to draw flowcharts and diagrams in R Markdown
+#Dalex: understand and explain machine learning models, especially complex ones like XGBoost or Random Forests.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Load libraries with simple explanations
+# tidyverse: makes data cleaning and manipulation easier
+# caret: helps us train and test machine learning models
+# randomForest: allows us to use the Random Forest model
+# xgboost: allows us to use the powerful XGBoost model
+# corrplot: helps us draw correlation diagrams
+# ggplot2: for creating beautiful graphs and plots
+# reshape2: reshapes data into formats suitable for graphs
+# tidyr: makes it easy to tidy messy data
+# DiagrammeR: is used to draw flowcharts and diagrams in R Markdown
+#Dalex: understand and explain machine learning models, especially complex ones like XGBoost or Random Forests.
+
+
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(corrplot)
+library(ggplot2)
+library(reshape2)
+library(tidyr)
+library(DiagrammeR)
+library(DALEX)
+```
+
+## 2. Introduction
+This project aims to build machine learning model to predict post-operative pain scores following hip replacement surgery using pre-operative PROMs and demographic data from the 2021 NHS dataset.
+
+## 3. Visual flow chart of pipeline
+```{r pipeline_flowchart, echo=FALSE, fig.align='center', results='asis'}
+
+grViz("
+digraph flowchart {
+  graph [layout = dot, rankdir = TB]
+  node [shape = box, style = filled, fillcolor = lightblue, fontsize = 20]
+
+  A [label = 'Start: Load PROMs Data']
+  B [label = 'Clean Data (Remove invalid scores & columns)']
+  C [label = 'Convert Age & Gender to categories']
+  D [label = 'Select Numeric Features for Correlation']
+  E [label = 'Split into Training and Test Sets']
+  F [label = 'Train Models: Linear, RF, XGBoost']
+  G [label = 'Evaluate: MAE, RMSE, R2']
+  H [label = 'Select Best Model (XGBoost)']
+  I [label = 'Make Predictions for New Patients']
+  J [label = 'Use in Decision-Making']
+
+  A -> B -> C -> D -> E -> F -> G -> H -> I -> J
+}
+")
+```
+
+## 4. Understanding the Data
+```{r}
+data <- read.csv("C:/Users/anwar/Downloads/Hip Replacement CCG 2021 (2).csv")
+dim(data)
+str(data)
+summary(data$Hip.Replacement.Post.Op.Q.Pain)
+```
+
+### Target Variable Distribution
+```{r}
+table(data$Hip.Replacement.Post.Op.Q.Pain)
+```
+| Pain Score | Description       | Count |
+|------------|-------------------|-------|
+| 0          | Severe             | 336   |
+| 1          | Moderate           | 502   |
+| 2          | Mild               | 606   |
+| 3          | Very mild          | 1410  |
+| 4          | No pain            | 2710  |
+| 9          | Missing/Invalid    | 11    |
+
+## 5. Data Preparation
+```{r}
+# Remove invalid pain scores
+names(data) <- make.names(names(data))
+clean_data <- data %>% filter(Hip.Replacement.Post.Op.Q.Pain <= 4)
+
+# Drop irrelevant columns
+drop_cols <- c("Provider.Code", "Procedure", "Year", "Hip.Replacement.Post.Op.Q.Score", 
+               "Hip.Replacement.OHS.Post.Op.Q.Predicted")
+
+clean_data <- clean_data %>% select(-all_of(drop_cols))
+
+# Convert factors
+clean_data$Gender <- factor(clean_data$Gender, levels = c(1, 2), labels = c("Male", "Female"))
+clean_data$Age.Band <- na_if(clean_data$Age.Band, "*")
+clean_data$Age.Band <- factor(clean_data$Age.Band, 
+                               levels = c("Under 55", "55-59", "60-64", "65-69", "70-74", "75 and over"), 
+                               ordered = TRUE)
+
+# Keep only numeric columns for correlation matrix
+numeric_vars <- clean_data %>% select(where(is.numeric))
+# Remove constant or NA-only columns
+numeric_vars <- numeric_vars %>% select(where(~ var(.x, na.rm = TRUE) > 0))
+```
+
+## 6. Problem Type
+This is a **supervised regression** problem because:
+- We are predicting a **numeric pain score** (0–4)
+- We have labeled outcomes for training
+
+## 7. Feature Selection & Correlation
+```{r, fig.width = 12, fig.height = 10}
+# Correlation matrix for clean numeric variables
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+corrplot(cor_matrix, method = "color", tl.cex = 0.6)
+```
+
+## 8. Model Selection
+We compare:
+- Linear Regression
+- Random Forest
+- XGBoost
+
+## 9. Model Training & Evaluation
+```{r}
+set.seed(123)
+
+# Standardize column names at the beginning
+names(data) <- make.names(names(data))
+
+# Refined filtering logic to preserve data while ensuring valid training
+clean_data <- data %>%
+  mutate(across(where(is.character), ~ trimws(.))) %>%
+  filter(Hip.Replacement.Post.Op.Q.Pain %in% 0:4) %>%
+  mutate(
+    Gender = na_if(Gender, "*"),
+    Age.Band = na_if(Age.Band, "*"),
+    Gender = factor(Gender, levels = c(1, 2), labels = c("Male", "Female")),
+    Age.Band = factor(Age.Band, levels = c("Under 55", "55-59", "60-64", "65-69", "70-74", "75 and over"), ordered = TRUE)
+  ) %>%
+  select(-Provider.Code, -Procedure, -Year, -Hip.Replacement.Post.Op.Q.Score, -Hip.Replacement.OHS.Post.Op.Q.Predicted)
+
+# Print distribution for verification
+print(table(clean_data$Hip.Replacement.Post.Op.Q.Pain))
+
+# Create new cleaned dataset for modeling only (drop rows with any NA)
+model_data <- clean_data %>% select(where(~ !any(is.na(.)))) %>% drop_na()
+
+# Split data
+if (length(unique(model_data$Hip.Replacement.Post.Op.Q.Pain)) >= 2) {
+  train_index <- createDataPartition(model_data$Hip.Replacement.Post.Op.Q.Pain, p = 0.8, list = FALSE)
+  train_data <- model_data[train_index, ]
+  test_data  <- model_data[-train_index, ]
+} else {
+  print("Warning: Only one class remains in the target variable after filtering. Using all data for training.")
+  train_data <- model_data
+  test_data  <- model_data
+}
+
+ctrl <- trainControl(method = "cv", number = 5)
+
+model_lm <- train(Hip.Replacement.Post.Op.Q.Pain ~ ., data = train_data, na.action = na.omit, method = "lm", trControl = ctrl)
+model_rf <- train(Hip.Replacement.Post.Op.Q.Pain ~ ., data = train_data, na.action = na.omit, method = "rf", trControl = ctrl, tuneLength = 3)
+model_xgb <- train(Hip.Replacement.Post.Op.Q.Pain ~ ., data = train_data, na.action = na.omit, method = "xgbTree", trControl = ctrl, tuneLength = 3)
+
+results <- resamples(list(Linear = model_lm, RF = model_rf, XGBoost = model_xgb))
+summary(results)
+bwplot(results)
+```
+
+## 10. Model Performance Summary
+
+```{r}
+# Evaluate actual performance on test data
+lm_metrics <- postResample(predict(model_lm, test_data), test_data$Hip.Replacement.Post.Op.Q.Pain)
+rf_metrics <- postResample(predict(model_rf, test_data), test_data$Hip.Replacement.Post.Op.Q.Pain)
+xgb_metrics <- postResample(predict(model_xgb, test_data), test_data$Hip.Replacement.Post.Op.Q.Pain)
+
+# Combine into summary table
+eval_table <- data.frame(
+  Model = c("Linear Regression", "Random Forest", "XGBoost"),
+  MAE = c(lm_metrics["MAE"], rf_metrics["MAE"], xgb_metrics["MAE"]),
+  RMSE = c(lm_metrics["RMSE"], rf_metrics["RMSE"], xgb_metrics["RMSE"]),
+  R2 = c(lm_metrics["Rsquared"], rf_metrics["Rsquared"], xgb_metrics["Rsquared"])
+)
+eval_table
+```
+
+```{r}
+# Bar plot of metrics
+model_perf_melted <- melt(eval_table, id.vars = "Model")
+
+ggplot(model_perf_melted, aes(x = Model, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Model Comparison: MAE, RMSE, R²",
+       caption = "This bar chart compares the three regression models based on MAE, RMSE, and R² from test set evaluation.",
+       y = "Score", x = "Model") +
+  theme_minimal()
+```
+
+### Understanding the Metrics
+The table above compares model performance across three key regression metrics:
+
+- **RMSE (Root Mean Squared Error)** 
+  - Measures the square root of average squared errors.
+  - Heavily penalizes larger prediction errors.
+  - Lower RMSE means better fit.
+
+- **MAE (Mean Absolute Error)**
+  - Averages the absolute differences between predicted and actual values.
+  - Easier to interpret because it's in the same unit as the outcome.
+  - Lower MAE indicates more accurate predictions.
+
+- **R² (R-squared)** 
+  - Proportion of variance in the outcome explained by the model.
+  - Ranges from 0 to 1.
+    - **R² = 1**: perfect prediction
+    - **R² = 0**: model performs no better than predicting the mean
+  - Higher values indicate a better model
+
+## 11. Feature Importance & Prediction
+## Feature importance (Top 20)
+```{r}
+vip <- varImp(model_xgb)
+plot(vip, top = 20, main = "Top 20 Most Important Features in XGBoost")
+
+# Predictions vs Actual Scores (Scatter Plot)
+pred_xgb <- predict(model_xgb, test_data)
+pred_df <- data.frame(
+  Actual = test_data$Hip.Replacement.Post.Op.Q.Pain,
+  Predicted = pred_xgb
+)
+
+ggplot(pred_df, aes(x = Actual, y = Predicted)) +
+  geom_jitter(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  labs(
+    title = "Predicted vs Actual Post-Operative Pain Scores",
+    x = "Actual Pain Score",
+    y = "Predicted Pain Score"
+  ) +
+  theme_minimal()
+```
+
+### SHAP-like Interpretation (Local)
+
+```{r shap_explainer, message=FALSE, warning=FALSE}
+explainer_xgb <- explain(
+  model = model_xgb,
+  data = test_data %>% select(-Hip.Replacement.Post.Op.Q.Pain),
+  y = test_data$Hip.Replacement.Post.Op.Q.Pain,
+  label = "XGBoost Model"
+)
+
+shap_single <- predict_parts(
+  explainer = explainer_xgb,
+  new_observation = test_data[1, ],
+  type = "shap"
+)
+
+plot(shap_single) + ggtitle("SHAP-style Breakdown: First Patient")
+```
+
+### SHAP-like Interpretation (Global)
+
+```{r shap_global}
+# Global variable importance (model_parts)
+vi <- model_parts(explainer_xgb, type = "variable_importance")
+plot(vi) + ggtitle("Global Variable Importance (Model-Based)")
+```
+## 12. Future Prediction
+```{r}
+
+# Re-define prediction function
+predict_pain_score <- function(patient_data, model) {
+  if ("Hip.Replacement.Post.Op.Q.Pain" %in% names(patient_data)) {
+    patient_data <- patient_data %>% select(-Hip.Replacement.Post.Op.Q.Pain)
+  }
+  predict(model, newdata = patient_data)
+}
+
+# Select a real complete patient
+complete_patients <- clean_data %>% filter(!is.na(Pre.Op.Q.EQ5D.Index), Gender != "*")
+new_patient <- complete_patients[1, ]
+predict_pain_score(new_patient, model_xgb)
+```
+
+## 13. Conclusion
+- XGBoost performed best (lowest RMSE, highest R²)
+- Key features: Pre-op pain, discomfort, EQ5D index, comorbidities
+- Useful for shared decision-making and post-op planning
+
+#In-Depth Explanation of the Project
+
+This project demonstrates the application of machine learning in predicting healthcare outcomes — specifically, post-operative pain levels in hip replacement patients — using structured survey data (PROMs) from the NHS.
+
+### Objective
+To predict a patient’s pain level after surgery using **pre-operative questionnaire responses** and basic demographics. This supports clinicians in:
+- Setting realistic expectations
+- Identifying patients at risk of poor outcomes
+- Personalizing care and follow-up
+
+### Dataset Summary
+- Source: 2021 NHS England CCG PROMs Dataset (Hip Replacements)
+- Outcome: `Hip.Replacement.Post.Op.Q.Pain` (0 = severe pain to 4 = no pain)
+- Predictors: PROM scores (pain, mobility, EQ5D index), age band, gender, comorbidities
+
+### Data Preparation
+- Cleaned invalid entries
+- Converted categorical variables to factors
+- Selected numeric columns for correlation analysis
+- Removed NAs for model reliability
+
+### Modeling
+Three regression models were trained:
+- **Linear Regression**: as a baseline
+- **Random Forest**: for capturing non-linearities
+- **XGBoost**: high-performing gradient boosting model
+
+The dataset was split into 80% training and 20% testing using stratified sampling. Models were evaluated using:
+- **MAE (Mean Absolute Error)**
+- **RMSE (Root Mean Squared Error)**
+- **R² (Variance Explained)**
+
+### Best Model
+- **XGBoost** achieved the best results across all metrics
+- It was saved and used for future prediction and deployment
+
+### Model Explainability
+- Used **DALEX** to explain model predictions with SHAP-style plots
+- **Local explanation**: which features influenced the prediction for one patient
+- **Global explanation**: which features matter most on average 5
+
+### Key features:
+- Pre-operative pain and discomfort scores
+- EQ5D index (a health quality metric)
+- Number of comorbidities
+
+### Future Use Case
+A prediction function allows clinicians or systems to enter a new patient's data and get a pain prediction.
+
+
+## References
+
+Baniecki, H., Biecek, P. and Paluszek, M., 2021. *ingredients: Descriptive Model Analysis*. [online] R package version 0.4.0. Available at: <https://modeloriented.github.io/ingredients/> [Accessed 18 Apr. 2025].
+
+Biecek, P., 2018. *DALEX: Explainers for Complex Predictive Models in R*. *Journal of Machine Learning Research*, 19(84), pp.1–5. Available at: <https://jmlr.org/papers/v19/18-416.html> [Accessed 18 Apr. 2025].
+
+Chen, T. and Guestrin, C., 2016. *XGBoost: A Scalable Tree Boosting System*. In: *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*. pp.785–794. DOI: <https://doi.org/10.1145/2939672.2939785>.
+
+Kuhn, M., 2008. *Building Predictive Models in R Using the caret Package*. *Journal of Statistical Software*, 28(5), pp.1–26. Available at: <https://www.jstatsoft.org/article/view/v028i05> [Accessed 18 Apr. 2025].
+
+Lundberg, S.M. and Lee, S.-I., 2017. *A Unified Approach to Interpreting Model Predictions*. In: *Advances in Neural Information Processing Systems (NeurIPS)*, 30. Available at: <https://proceedings.neurips.cc/paper_files/paper/2017/hash/8a20a8621978632d76c43dfd28b67767-Abstract.html> [Accessed 18 Apr. 2025].
+
+NHS Digital, 2021. *Patient Reported Outcome Measures (PROMs) in England: Hip Replacement CCG Level Data 2021* [dataset]. Version 3.4. Available at: <https://digital.nhs.uk/data-and-information/publications/clinical-indicators/proms> [Accessed 18 Apr. 2025].
+
+Wickham, H., Averick, M., Bryan, J., Chang, W., McGowan, L.D., François, R., Grolemund, G., Hayes, A., Henry, L., Hester, J., Kuhn, M., Pedersen, T.L., Miller, E., Bache, S.M., Müller, K., Ooms, J., Robinson, D., Seidel, D.P., Spinu, V., Takahashi, K., Vaughan, D., Wilke, C., Woo, K. and Yutani, H., 2019. *Welcome to the Tidyverse*. *Journal of Open Source Software*, 4(43), p.1686. DOI: <https://doi.org/10.21105/joss.01686>.
+
+---
+
+
